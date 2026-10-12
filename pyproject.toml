@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pytorches-xpu"
-version = "0.1.0"
+version = "0.1.1"
 description = "Intel GPU (XPU) backend for PyTorches (OpenCL, loaded at runtime; Intel Arc and integrated GPUs)"
 readme = "README.md"
 requires-python = ">=3.11"
