@@ -850,6 +850,7 @@ unsafe extern "C" fn supports_op(code: u32) -> u32 {
             | MUL
             | DIV
             | MATMUL
+            | MATMUL_T
             | AXPY
             | SUM_AXIS
             | COPY
@@ -957,6 +958,195 @@ fn plan(shape: &[u64], strides: &[&[u64]]) -> R<Plan> {
     Ok(Plan { flat, use32, dims })
 }
 
+/// `C[m,n] = A[m,k] * B[k,n]` on contiguous row-major buffers. Uses the sub-group kernel (see
+/// kernels.cl) when the shape allows and the driver has it; leftover rows (m % 16) and everything else
+/// use the general tiled kernel.
+#[allow(clippy::too_many_arguments)]
+unsafe fn matmul_core(
+    g: &Global,
+    d: &Dev,
+    st: &State,
+    a: H,
+    b: H,
+    c: H,
+    m: u64,
+    k: u64,
+    nn: u64,
+) -> R<()> {
+    unsafe {
+        if m == 0 || nn == 0 {
+            return Ok(());
+        }
+        let mut done = 0u64;
+        if sg_matmul_applies(st, m, k, nn) {
+            let fast = m / SG_TILE_ROWS * SG_TILE_ROWS;
+            launch(
+                g,
+                d,
+                st,
+                "matmul_sg",
+                &[
+                    Arg::Mem(a),
+                    Arg::Mem(b),
+                    Arg::Mem(c),
+                    Arg::U64(fast),
+                    Arg::U64(nn),
+                    Arg::U64(k),
+                ],
+                &[(nn / 32) as usize * 16, (fast / SG_TILE_ROWS) as usize],
+                Some(&[16, 1]),
+            )?;
+            done = fast;
+        }
+        let rest = m - done;
+        if rest == 0 {
+            return Ok(());
+        }
+        let gx = nn.div_ceil(64) as usize * 16;
+        let gy = rest.div_ceil(64) as usize * 16;
+        launch(
+            g,
+            d,
+            st,
+            "matmul",
+            &[
+                Arg::Mem(a),
+                Arg::Mem(b),
+                Arg::Mem(c),
+                Arg::U64(rest),
+                Arg::U64(nn),
+                Arg::U64(k),
+                Arg::U64(done),
+            ],
+            &[gx, gy],
+            Some(&[16, 16]),
+        )
+    }
+}
+
+/// Whether `matmul_sg` can run (some of) an `[m,k] x [k,n]` product. The kernel uses 32-bit element
+/// offsets, so every matrix must have fewer than 2^32 elements.
+fn sg_matmul_applies(st: &State, m: u64, k: u64, nn: u64) -> bool {
+    let fits32 = |a: u64, b: u64| a.checked_mul(b).is_some_and(|v| v <= u32::MAX as u64);
+    nn.is_multiple_of(32)
+        && k.is_multiple_of(16)
+        && k > 0
+        && m >= SG_TILE_ROWS
+        && fits32(m, k)
+        && fits32(k, nn)
+        && fits32(m, nn)
+        && st.kernels.as_ref().unwrap().contains_key("matmul_sg")
+}
+
+/// `dst[cols, rows] = src[rows, cols]^T`, both contiguous.
+unsafe fn transpose_2d(
+    g: &Global,
+    d: &Dev,
+    st: &State,
+    src: H,
+    dst: H,
+    rows: u64,
+    cols: u64,
+) -> R<()> {
+    unsafe {
+        launch(
+            g,
+            d,
+            st,
+            "transpose2d",
+            &[Arg::Mem(src), Arg::Mem(dst), Arg::U64(rows), Arg::U64(cols)],
+            &[
+                cols.div_ceil(32) as usize * 32,
+                rows.div_ceil(32) as usize * 8,
+            ],
+            Some(&[32, 8]),
+        )
+    }
+}
+
+/// A scratch buffer from the caching allocator, returned to it on drop. Freeing right after enqueueing
+/// the work that uses it is safe: the queue is in order and the cache only hands a buffer out again to
+/// later work, which is queued behind.
+struct Scratch {
+    device: u32,
+    ptr: *mut c_void,
+}
+
+impl Scratch {
+    unsafe fn new(device: u32, elems: u64) -> R<Scratch> {
+        unsafe {
+            let mut ptr = null_mut();
+            let status = alloc_buf(device, (elems * 4) as usize, &mut ptr);
+            if status != STATUS_OK {
+                return fail(status, "matmul scratch buffer");
+            }
+            Ok(Scratch { device, ptr })
+        }
+    }
+
+    fn handle(&self) -> H {
+        self.ptr as H
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        unsafe { free_buf(self.device, self.ptr) }
+    }
+}
+
+/// `C[m,n] = op(A) * op(B)` where a transposed operand is stored as its transpose (`A` as `[k,m]`,
+/// `B` as `[n,k]`). There is no transposed-operand kernel for this GPU (reading B^T column-wise from
+/// each lane was 4x slower), so a transpose is materialized, but only of whatever is cheapest to move:
+///  * `A^T B`: transpose A (for a weight gradient `X^T dY` that is the small activation).
+///  * `A B^T`: either transpose B, or compute `C^T = B A^T` (transpose A, transpose the result). With a
+///    small batch (m << n, k) that moves a fraction of the bytes: for a 256x2048x2048 product it is 2 MB
+///    of traffic per tensor instead of 16 MB for the weights.
+///  * `A^T B^T`: `C^T = B A`, then transpose the result.
+unsafe fn matmul_t(
+    device: u32,
+    g: &Global,
+    d: &Dev,
+    st: &State,
+    (a, b, c): (H, H, H),
+    (m, k, nn): (u64, u64, u64),
+    (a_t, b_t): (bool, bool),
+) -> R<()> {
+    unsafe {
+        if k == 0 {
+            return matmul_core(g, d, st, a, b, c, m, 0, nn);
+        }
+        match (a_t, b_t) {
+            (false, false) => matmul_core(g, d, st, a, b, c, m, k, nn),
+            (true, false) => {
+                let at = Scratch::new(device, m * k)?;
+                transpose_2d(g, d, st, a, at.handle(), k, m)?; // [k,m] -> [m,k]
+                matmul_core(g, d, st, at.handle(), b, c, m, k, nn)
+            }
+            (false, true) => {
+                // Moving B^T costs 2*n*k elements; the C^T route costs 2*m*k + 2*m*n. It also needs the
+                // fast kernel to apply to the swapped product (n x k times k x m), or it would lose.
+                if sg_matmul_applies(st, nn, k, m) && m * k + m * nn < nn * k {
+                    let at = Scratch::new(device, m * k)?;
+                    let ct = Scratch::new(device, nn * m)?;
+                    transpose_2d(g, d, st, a, at.handle(), m, k)?; // A [m,k] -> A^T [k,m]
+                    matmul_core(g, d, st, b, at.handle(), ct.handle(), nn, k, m)?; // C^T[n,m] = B[n,k] A^T[k,m]
+                    transpose_2d(g, d, st, ct.handle(), c, nn, m) // C^T [n,m] -> C [m,n]
+                } else {
+                    let bt = Scratch::new(device, nn * k)?;
+                    transpose_2d(g, d, st, b, bt.handle(), nn, k)?; // [n,k] -> [k,n]
+                    matmul_core(g, d, st, a, bt.handle(), c, m, k, nn)
+                }
+            }
+            (true, true) => {
+                let ct = Scratch::new(device, nn * m)?;
+                matmul_core(g, d, st, b, a, ct.handle(), nn, k, m)?; // C^T[n,m] = B[n,k] A[k,m]
+                transpose_2d(g, d, st, ct.handle(), c, nn, m)
+            }
+        }
+    }
+}
+
 unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T]) -> R<()> {
     use op::*;
     unsafe {
@@ -969,7 +1159,7 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
         let need_in = match op_code {
             FILL | RAND_NORMAL => 0,
             NEG | EXP | LOG | RELU | TANH | STEP | COPY | SUM_AXIS => 1,
-            ADD | SUB | MUL | DIV | MATMUL | AXPY => 2,
+            ADD | SUB | MUL | DIV | MATMUL | MATMUL_T | AXPY => 2,
             _ => return fail(STATUS_UNSUPPORTED, format!("unsupported op {op_code}")),
         };
         if ins.len() != need_in {
@@ -983,7 +1173,7 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
                 return fail(STATUS_INVALID_ARGUMENT, "shape/strides mismatch");
             }
         }
-        if n == 0 && op_code != SUM_AXIS && op_code != MATMUL {
+        if n == 0 && op_code != SUM_AXIS && op_code != MATMUL && op_code != MATMUL_T {
             return Ok(());
         }
         let mut st = lock(d);
@@ -1174,62 +1364,50 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
                 if m == 0 || nn == 0 {
                     return Ok(());
                 }
-                // Sub-group fast path (see kernels.cl) for N % 32 == 0 and K % 16 == 0 on whole 16-row
-                // blocks, when the driver has it. Leftover rows (m % 16) use the general kernel.
-                let mut done = 0u64;
-                // The kernel uses 32-bit element offsets, so every matrix must have fewer than 2^32 elements.
-                let fits32 =
-                    |a: u64, b: u64| a.checked_mul(b).is_some_and(|v| v <= u32::MAX as u64);
-                if nn % 32 == 0
-                    && k % 16 == 0
-                    && k > 0
-                    && m >= SG_TILE_ROWS
-                    && fits32(m, k)
-                    && fits32(k, nn)
-                    && fits32(m, nn)
-                    && st.kernels.as_ref().unwrap().contains_key("matmul_sg")
-                {
-                    let fast = m / SG_TILE_ROWS * SG_TILE_ROWS;
-                    launch(
-                        g,
-                        d,
-                        st,
-                        "matmul_sg",
-                        &[
-                            Arg::Mem(a.data),
-                            Arg::Mem(b.data),
-                            Arg::Mem(out.data),
-                            Arg::U64(fast),
-                            Arg::U64(nn),
-                            Arg::U64(k),
-                        ],
-                        &[(nn / 32) as usize * 16, (fast / SG_TILE_ROWS) as usize],
-                        Some(&[16, 1]),
-                    )?;
-                    done = fast;
+                matmul_core(g, d, st, a.data, b.data, out.data, m, k, nn)
+            }
+            MATMUL_T => {
+                let (a, b) = (&ins[0], &ins[1]);
+                if a.shape.len() != 2 || b.shape.len() != 2 || out.shape.len() != 2 {
+                    return fail(STATUS_INVALID_ARGUMENT, "matmul needs 2-D operands");
                 }
-                let rest = m - done;
-                if rest == 0 {
+                if !a.is_contiguous() || !b.is_contiguous() {
+                    return fail(STATUS_INVALID_ARGUMENT, "matmul inputs must be contiguous");
+                }
+                let (a_t, b_t) = (attrs.ints[0] & 1 != 0, attrs.ints[0] & 2 != 0);
+                let (m, nn) = (out.shape[0], out.shape[1]);
+                // Stored A is [m,k] (or [k,m] when transposed); stored B is [k,n] (or [n,k]).
+                let k = if a_t { a.shape[0] } else { a.shape[1] };
+                let a_ok = if a_t {
+                    a.shape[1] == m
+                } else {
+                    a.shape[0] == m
+                };
+                let b_ok = if b_t {
+                    b.shape == [nn, k]
+                } else {
+                    b.shape == [k, nn]
+                };
+                if !a_ok || !b_ok {
+                    return fail(
+                        STATUS_INVALID_ARGUMENT,
+                        format!(
+                            "matmul_t shape mismatch {:?} x {:?} -> {:?} (flags {})",
+                            a.shape, b.shape, out.shape, attrs.ints[0]
+                        ),
+                    );
+                }
+                if m == 0 || nn == 0 {
                     return Ok(());
                 }
-                let gx = nn.div_ceil(64) as usize * 16;
-                let gy = rest.div_ceil(64) as usize * 16;
-                launch(
+                matmul_t(
+                    device,
                     g,
                     d,
                     st,
-                    "matmul",
-                    &[
-                        Arg::Mem(a.data),
-                        Arg::Mem(b.data),
-                        Arg::Mem(out.data),
-                        Arg::U64(rest),
-                        Arg::U64(nn),
-                        Arg::U64(k),
-                        Arg::U64(done),
-                    ],
-                    &[gx, gy],
-                    Some(&[16, 16]),
+                    (a.data, b.data, out.data),
+                    (m, k, nn),
+                    (a_t, b_t),
                 )
             }
             SUM_AXIS => {
