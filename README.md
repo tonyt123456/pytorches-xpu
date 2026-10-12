@@ -43,3 +43,11 @@ The plugin depends on `pytorches-plugin-abi` (and, for tests, `pytorches-core` a
 
 Tag `vX.Y.Z`; the workflow builds Windows and manylinux wheels and publishes to PyPI by trusted
 publishing. Bump the version in `pyproject.toml` and `Cargo.toml` together.
+
+## Tools
+
+`tools/` has what was used to tune the matmul (needs `pip install pyopencl`; not a plugin dependency):
+`isa.py` disassembles the compiled kernel with Intel's IGA to show the machine code the driver produced,
+`matmul_bench.py` times kernels directly through OpenCL, and `matmul_variants.cl` is the parameterized
+experiment kernel. `PYTORCHES_XPU_KERNELS=<file>` makes the plugin compile a kernel file instead of the
+embedded one, for trying a change without rebuilding.
