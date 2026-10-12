@@ -67,6 +67,46 @@ __kernel void unary_flat(__global const float* x, __global float* y, ulong n, in
     for (ulong i = get_global_id(0); i < n; i += get_global_size(0)) y[i] = un(op, x[i]);
 }
 
+// 4 floats per work-item (one 16-byte load/store per operand instead of four 4-byte ones): about 80 GB/s
+// against 61 for the scalar kernels on an Arc 140T, where PyTorch reaches ~72. Buffers are 16-byte aligned
+// (whole cl_mem objects). The first work-item also handles the up-to-3 elements past the last whole quad.
+static inline float4 un4(int op, float4 v) {
+    switch (op) {
+        case 1: return -v;
+        case 2: return exp(v);
+        case 3: return log(v);
+        case 4: return fmax(v, (float4)(0.0f));
+        case 5: return tanh(v);
+        case 6: return select((float4)(0.0f), (float4)(1.0f), v > (float4)(0.0f));
+        default: return v;
+    }
+}
+
+static inline float4 bi4(int op, float4 a, float4 b) {
+    switch (op) {
+        case 0: return a + b;
+        case 1: return a - b;
+        case 2: return a * b;
+        default: return a / b;
+    }
+}
+
+__kernel void unary_flat4(__global const float* x, __global float* y, ulong n, int op) {
+    const ulong n4 = n >> 2;
+    for (ulong i = get_global_id(0); i < n4; i += get_global_size(0))
+        ((__global float4*)y)[i] = un4(op, ((__global const float4*)x)[i]);
+    if (get_global_id(0) == 0)
+        for (ulong j = n4 << 2; j < n; j++) y[j] = un(op, x[j]);
+}
+
+__kernel void binary_flat4(__global const float* a, __global const float* b, __global float* y, ulong n, int op) {
+    const ulong n4 = n >> 2;
+    for (ulong i = get_global_id(0); i < n4; i += get_global_size(0))
+        ((__global float4*)y)[i] = bi4(op, ((__global const float4*)a)[i], ((__global const float4*)b)[i]);
+    if (get_global_id(0) == 0)
+        for (ulong j = n4 << 2; j < n; j++) y[j] = bi(op, a[j], b[j]);
+}
+
 __kernel void unary_strided(__global const float* x, __global float* y, ulong n, int op, Dims d, int use32) {
     for (ulong i = get_global_id(0); i < n; i += get_global_size(0)) y[i] = un(op, x[offs(i, &d, use32)]);
 }
@@ -105,6 +145,14 @@ __kernel void axpy(__global const float* a, __global const float* b, __global fl
     for (ulong i = get_global_id(0); i < n; i += get_global_size(0)) y[i] = a[i] + alpha * b[i];
 }
 
+__kernel void axpy4(__global const float* a, __global const float* b, __global float* y, ulong n, float alpha) {
+    const ulong n4 = n >> 2;
+    for (ulong i = get_global_id(0); i < n4; i += get_global_size(0))
+        ((__global float4*)y)[i] = ((__global const float4*)a)[i] + alpha * ((__global const float4*)b)[i];
+    if (get_global_id(0) == 0)
+        for (ulong j = n4 << 2; j < n; j++) y[j] = a[j] + alpha * b[j];
+}
+
 __kernel void fill(__global float* y, ulong n, float v) {
     for (ulong i = get_global_id(0); i < n; i += get_global_size(0)) y[i] = v;
 }
@@ -136,10 +184,12 @@ __kernel void rand_normal(__global float* y, ulong n, ulong seed) {
 
 __kernel __attribute__((reqd_work_group_size(16, 16, 1)))
 void matmul(__global const float* A, __global const float* B, __global float* C, ulong M, ulong N, ulong K,
-            ulong roff) {
-    // `roff`: first output row to compute (A and C are advanced to it; M is then the number of rows).
+            ulong roff, ulong coff, ulong ld) {
+    // Computes C[roff .. roff+M, coff .. coff+N] of a matrix whose rows are `ld` elements apart. A is
+    // [rows, K] with row stride K; B and C have row stride `ld`. (M, N) are the size of the block.
     A += roff * K;
-    C += roff * N;
+    B += coff;
+    C += roff * ld + coff;
     __local float As[BK][BM + 1];  // As[k][m]
     __local float Bs[BK][BN];      // Bs[k][n]
     const uint tx = get_local_id(0), ty = get_local_id(1);
@@ -162,7 +212,7 @@ void matmul(__global const float* A, __global const float* B, __global float* C,
             uint idx = tid + l * 256;
             uint r = idx / BN, c = idx % BN;
             ulong gr = k0 + r, gc = col0 + c;
-            Bs[r][c] = (gr < K && gc < N) ? B[gr * N + gc] : 0.0f;
+            Bs[r][c] = (gr < K && gc < N) ? B[gr * ld + gc] : 0.0f;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 #pragma unroll
@@ -184,15 +234,15 @@ void matmul(__global const float* A, __global const float* B, __global float* C,
         if (gr >= M) continue;
         for (int j = 0; j < TN; j++) {
             ulong gc = col0 + tx + j * 16;
-            if (gc < N) C[gr * N + gc] = acc[i][j];
+            if (gc < N) C[gr * ld + gc] = acc[i][j];
         }
     }
 }
 
 // ---- matmul fast path: sub-group tiles, no local memory ---------------------------------------
-// Needs N % 32 == 0, K % 16 == 0, a whole number of 16-row blocks, M*K, K*N and M*N below 2^32 elements
-// (the host checks; a leftover of fewer than 16 rows goes to the general kernel above) and
-// cl_intel_subgroups. A 16-lane sub-group computes a 16 x 32 tile of C: lane j owns columns j and j+16 of
+// Computes the part of C made of whole 16 x 32 tiles (the host sends the leftover rows and columns to the
+// general kernel above), for any K (a K % 16 tail runs one step at a time). Needs M*K, K*N and M*N below
+// 2^32 elements (the host checks) and cl_intel_subgroups. A 16-lane sub-group computes a 16 x 32 tile of C: lane j owns columns j and j+16 of
 // every tile row. B rows are fetched with one wide block read (lane j gets B[k][j] and B[k][j+16]);
 // A[r][k0+lane] is block-read and each element is broadcast to all lanes by sub_group_broadcast.
 //
@@ -236,7 +286,8 @@ void matmul_sg(__global const float* A, __global const float* B, __global float*
     const __global uint* Bu = (const __global uint*)B;
     const uint aoff = row0 * K32;
     uint boff = col0;
-    for (uint k0 = 0; k0 < K32; k0 += 16) {
+    uint k0 = 0;
+    for (; k0 + 16 <= K32; k0 += 16) {
         float a[SG_TR];
 #pragma unroll
         for (int r = 0; r < SG_TR; r++) a[r] = as_float(intel_sub_group_block_read(Au + (aoff + r * K32 + k0)));
@@ -256,6 +307,19 @@ void matmul_sg(__global const float* A, __global const float* B, __global float*
             }
         }
         boff += 16 * N32;
+    }
+    // K is not a multiple of 16: the last K % 16 steps, one at a time. A[r][k] is the same address for every
+    // lane (a broadcast load); B still comes in as one wide block read.
+    for (; k0 < K32; k0++) {
+        const uint2 u = intel_sub_group_block_read2(Bu + boff);
+        boff += N32;
+        const float b0 = as_float(u.s0), b1 = as_float(u.s1);
+#pragma unroll
+        for (int r = 0; r < SG_TR; r++) {
+            const float av = as_float(Au[aoff + r * K32 + k0]);
+            acc[r][0] = mad(av, b0, acc[r][0]);
+            acc[r][1] = mad(av, b1, acc[r][1]);
+        }
     }
     for (int r = 0; r < SG_TR; r++)
         for (int c = 0; c < SG_TC; c++) C[(row0 + r) * N32 + col0 + c * 16 + lane] = acc[r][c];

@@ -199,6 +199,12 @@ fn matmul_sizes() {
         (1000, 256, 64),
         (16, 17, 32),
         (16, 16, 33),
+        // Odd in every dimension at a size where the fast kernel covers most of the product: the K tail runs
+        // in the kernel, leftover rows and columns on the general one.
+        (1000, 1000, 1000),
+        (500, 300, 70),
+        (64, 100, 1000),
+        (257, 33, 129),
     ] {
         let (ca, xa) = both(d, &[m, k], 3);
         let (cb, xb) = both(d, &[k, n], 4);

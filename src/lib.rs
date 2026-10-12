@@ -388,10 +388,13 @@ const OPTIONAL_KERNELS: &[&str] = &["matmul_sg"];
 
 const KERNEL_NAMES: &[&str] = &[
     "unary_flat",
+    "unary_flat4",
     "unary_strided",
     "binary_flat",
+    "binary_flat4",
     "binary_strided",
     "axpy",
+    "axpy4",
     "transpose2d",
     "fill",
     "rand_normal",
@@ -897,6 +900,17 @@ unsafe fn tdesc(d: &TensorDesc) -> R<T> {
     }
 }
 
+/// The flat elementwise kernel to use for `n` elements and how many work-items it needs: the float4
+/// variant (`<base>4`, one work-item per four elements) unless there is less than one whole quad.
+fn flat_kernel(base: &'static str, n: u64) -> (&'static str, u64) {
+    match base {
+        "unary_flat" if n >= 4 => ("unary_flat4", n / 4),
+        "binary_flat" if n >= 4 => ("binary_flat4", n / 4),
+        "axpy" if n >= 4 => ("axpy4", n / 4),
+        _ => (base, n),
+    }
+}
+
 fn ew_global(n: u64) -> usize {
     (n.div_ceil(256).min(1 << 18) * 256) as usize
 }
@@ -958,9 +972,10 @@ fn plan(shape: &[u64], strides: &[&[u64]]) -> R<Plan> {
     Ok(Plan { flat, use32, dims })
 }
 
-/// `C[m,n] = A[m,k] * B[k,n]` on contiguous row-major buffers. Uses the sub-group kernel (see
-/// kernels.cl) when the shape allows and the driver has it; leftover rows (m % 16) and everything else
-/// use the general tiled kernel.
+/// `C[m,n] = A[m,k] * B[k,n]` on contiguous row-major buffers. The sub-group kernel (see kernels.cl)
+/// computes every whole 16 x 32 tile when the driver has it; the leftover rows (m % 16) and columns
+/// (n % 32), and everything when the shape is too small or too large for it, go to the general tiled
+/// kernel, which is slower but takes any block of the output.
 #[allow(clippy::too_many_arguments)]
 unsafe fn matmul_core(
     g: &Global,
@@ -977,9 +992,11 @@ unsafe fn matmul_core(
         if m == 0 || nn == 0 {
             return Ok(());
         }
-        let mut done = 0u64;
+        // The whole-tile region the fast kernel covers: rows [0, fast_m) x columns [0, fast_n).
+        let (mut fast_m, mut fast_n) = (0, 0);
         if sg_matmul_applies(st, m, k, nn) {
-            let fast = m / SG_TILE_ROWS * SG_TILE_ROWS;
+            fast_m = m / SG_TILE_ROWS * SG_TILE_ROWS;
+            fast_n = nn / 32 * 32;
             launch(
                 g,
                 d,
@@ -989,21 +1006,56 @@ unsafe fn matmul_core(
                     Arg::Mem(a),
                     Arg::Mem(b),
                     Arg::Mem(c),
-                    Arg::U64(fast),
+                    Arg::U64(fast_m),
                     Arg::U64(nn),
                     Arg::U64(k),
                 ],
-                &[(nn / 32) as usize * 16, (fast / SG_TILE_ROWS) as usize],
+                &[
+                    (fast_n / 32) as usize * 16,
+                    (fast_m / SG_TILE_ROWS) as usize,
+                ],
                 Some(&[16, 1]),
             )?;
-            done = fast;
         }
-        let rest = m - done;
-        if rest == 0 {
-            return Ok(());
+        // Leftover columns for all rows, then leftover rows for the columns the fast kernel did.
+        if fast_n < nn {
+            matmul_general(
+                g,
+                d,
+                st,
+                (a, b, c),
+                (m, nn, k),
+                (0, fast_n),
+                (m, nn - fast_n),
+            )?;
         }
-        let gx = nn.div_ceil(64) as usize * 16;
-        let gy = rest.div_ceil(64) as usize * 16;
+        if fast_m < m && fast_n > 0 {
+            matmul_general(
+                g,
+                d,
+                st,
+                (a, b, c),
+                (m, nn, k),
+                (fast_m, 0),
+                (m - fast_m, fast_n),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// The general kernel over the block `(rows, cols)` of C starting at `(roff, coff)`; `(m, nn, k)` are the
+/// full product's dimensions.
+unsafe fn matmul_general(
+    g: &Global,
+    d: &Dev,
+    st: &State,
+    (a, b, c): (H, H, H),
+    (_m, nn, k): (u64, u64, u64),
+    (roff, coff): (u64, u64),
+    (rows, cols): (u64, u64),
+) -> R<()> {
+    unsafe {
         launch(
             g,
             d,
@@ -1013,23 +1065,27 @@ unsafe fn matmul_core(
                 Arg::Mem(a),
                 Arg::Mem(b),
                 Arg::Mem(c),
-                Arg::U64(rest),
-                Arg::U64(nn),
+                Arg::U64(rows),
+                Arg::U64(cols),
                 Arg::U64(k),
-                Arg::U64(done),
+                Arg::U64(roff),
+                Arg::U64(coff),
+                Arg::U64(nn),
             ],
-            &[gx, gy],
+            &[
+                cols.div_ceil(64) as usize * 16,
+                rows.div_ceil(64) as usize * 16,
+            ],
             Some(&[16, 16]),
         )
     }
 }
 
-/// Whether `matmul_sg` can run (some of) an `[m,k] x [k,n]` product. The kernel uses 32-bit element
-/// offsets, so every matrix must have fewer than 2^32 elements.
+/// Whether `matmul_sg` can cover some of an `[m,k] x [k,n]` product: at least one whole tile, and every
+/// matrix under 2^32 elements (the kernel uses 32-bit element offsets).
 fn sg_matmul_applies(st: &State, m: u64, k: u64, nn: u64) -> bool {
     let fits32 = |a: u64, b: u64| a.checked_mul(b).is_some_and(|v| v <= u32::MAX as u64);
-    nn.is_multiple_of(32)
-        && k.is_multiple_of(16)
+    nn >= 32
         && k > 0
         && m >= SG_TILE_ROWS
         && fits32(m, k)
@@ -1238,18 +1294,19 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
                 let code = if op_code == COPY { 0 } else { op_code as i32 };
                 let p = plan(&x.shape, &[&x.strides])?;
                 if p.flat {
+                    let (name, items) = flat_kernel("unary_flat", n);
                     launch(
                         g,
                         d,
                         st,
-                        "unary_flat",
+                        name,
                         &[
                             Arg::Mem(x.data),
                             Arg::Mem(out.data),
                             Arg::U64(n),
                             Arg::I32(code),
                         ],
-                        &[ew_global(n)],
+                        &[ew_global(items)],
                         Some(&[256]),
                     )
                 } else {
@@ -1282,11 +1339,12 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
                 let code = (op_code - ADD) as i32;
                 let p = plan(&out.shape, &[&a.strides, &b.strides])?;
                 if p.flat {
+                    let (name, items) = flat_kernel("binary_flat", n);
                     launch(
                         g,
                         d,
                         st,
-                        "binary_flat",
+                        name,
                         &[
                             Arg::Mem(a.data),
                             Arg::Mem(b.data),
@@ -1294,7 +1352,7 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
                             Arg::U64(n),
                             Arg::I32(code),
                         ],
-                        &[ew_global(n)],
+                        &[ew_global(items)],
                         Some(&[256]),
                     )
                 } else {
@@ -1327,11 +1385,12 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
                     );
                 }
                 let alpha = f32::from_bits(attrs.ints[0] as u32);
+                let (name, items) = flat_kernel("axpy", n);
                 launch(
                     g,
                     d,
                     st,
-                    "axpy",
+                    name,
                     &[
                         Arg::Mem(a.data),
                         Arg::Mem(b.data),
@@ -1339,7 +1398,7 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
                         Arg::U64(n),
                         Arg::F32(alpha),
                     ],
-                    &[ew_global(n)],
+                    &[ew_global(items)],
                     Some(&[256]),
                 )
             }
