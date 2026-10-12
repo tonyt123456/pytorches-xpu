@@ -1,0 +1,12 @@
+/target
+/dist
+/.cargo/config.toml
+__pycache__/
+*.pyc
+/python/pytorches_xpu/*.dll
+/python/pytorches_xpu/*.so
+/python/pytorches_xpu/*.dylib
+/.venv
+/build
+*.egg-info
+/Cargo.lock

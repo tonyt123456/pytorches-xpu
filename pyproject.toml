@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pytorches-xpu"
+version = "0.1.0"
+description = "Intel GPU (XPU) backend for PyTorches (OpenCL, loaded at runtime; Intel Arc and integrated GPUs)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = ["pytorches-universe>=0.2.0"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Repository = "https://github.com/tonyt123456/pytorches-xpu"
+
+# pytorches finds this package through the entry point, locates its directory (without importing
+# it) and loads pytorches_plugin_xpu.{dll,so,dylib} and its manifest from there.
+[project.entry-points."pytorches.plugins"]
+xpu = "pytorches_xpu"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+packages = ["pytorches_xpu"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+pytorches_xpu = ["pytorches_plugin_xpu.*", "libpytorches_plugin_xpu.*"]
