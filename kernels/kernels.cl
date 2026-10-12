@@ -190,32 +190,63 @@ void matmul(__global const float* A, __global const float* B, __global float* C,
 }
 
 // ---- matmul fast path: sub-group tiles, no local memory ---------------------------------------
-// Needs N % 32 == 0, K % 16 == 0 and a whole number of 16-row blocks (the host checks; a leftover of
-// fewer than 16 rows goes to the general kernel above) and cl_intel_subgroups. A 16-lane
-// sub-group computes a 16 x 32 tile of C: lane j owns columns j and j+16 of every tile row. B rows are
-// fetched with one wide block read (lane j gets B[k][j] and B[k][j+16]); A[r][k0+lane] is loaded
-// coalesced and each element is broadcast to all lanes by sub_group_broadcast. About 2x the tiled
-// kernel above on an Arc 140T (2.3 vs 1.1 TFLOP/s); the fp32 peak measured on it is ~4.1.
-// Tried and not better: wider/narrower tiles, work-group sharing of B, tile-order swizzles, explicit
-// load prefetch (spills the 128-register file) and the 256-GRF mode (halves occupancy).
+// Needs N % 32 == 0, K % 16 == 0, a whole number of 16-row blocks, M*K, K*N and M*N below 2^32 elements
+// (the host checks; a leftover of fewer than 16 rows goes to the general kernel above) and
+// cl_intel_subgroups. A 16-lane sub-group computes a 16 x 32 tile of C: lane j owns columns j and j+16 of
+// every tile row. B rows are fetched with one wide block read (lane j gets B[k][j] and B[k][j+16]);
+// A[r][k0+lane] is block-read and each element is broadcast to all lanes by sub_group_broadcast.
+//
+// What it took to go from 2.4 to ~3.5 TFLOP/s on an Arc 140T (fp32 compute ceiling of this kernel's
+// FMA stream, with the loads removed, measured at 4.7-4.9; PyTorch reaches ~4.3). Found by reading the
+// compiled ISA (IGA disassembly of the program binary), not by guessing:
+//  * B loads were issued right before their FMAs, so every k step stalled on a full cache round trip.
+//    They now run SG_PF steps ahead through a small register ring. Deeper rings spill the 128-register
+//    file (acc 64 + A 32 + ring), which costs far more than it saves.
+//  * The order work-groups run in decides what the cache sees. Plain raster order streams all of B for
+//    every wave of tiles; grouped order (SG_GROUP tile-rows at a time) keeps concurrent tiles on a
+//    compact block of A and B. This alone is worth 1.5-1.7x at 4096.
+//  * 32-bit element offsets: 64-bit index math compiled to ~7 scalar instructions per A load and ~30 per
+//    B load. (On its own this changed nothing; the loads above were the limit.)
+// Remaining gap to PyTorch: the kernel is now bound by load bandwidth (192 bytes per 1024 FLOP). A 32-row
+// tile halves that but needs the 256-register mode, where this compiler spills; see benchmarks/README.md.
 #ifdef cl_intel_subgroups
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
 #define SG_TR 16
 #define SG_TC 2
+#define SG_PF 2
+#define SG_GROUP 8
 __kernel __attribute__((intel_reqd_sub_group_size(16)))
 void matmul_sg(__global const float* A, __global const float* B, __global float* C, ulong M, ulong N, ulong K) {
     const uint lane = get_sub_group_local_id();
-    const ulong col0 = (ulong)(get_global_id(0) / 16) * (16 * SG_TC);
-    const ulong row0 = (ulong)get_global_id(1) * SG_TR;
+    const uint N32 = (uint)N, K32 = (uint)K;
+    // Grouped tile order. One work-group is one sub-group (the host launches 16x1), so the group id is
+    // the tile id: `lin` is the order the hardware dispatches tiles in.
+    const uint tiles_x = get_num_groups(0), tiles_y = get_num_groups(1);
+    const uint lin = get_group_id(1) * tiles_x + get_group_id(0);
+    const uint per_group = SG_GROUP * tiles_x;
+    const uint first_row_tile = (lin / per_group) * SG_GROUP;
+    const uint rows_in_group = min(tiles_y - first_row_tile, (uint)SG_GROUP);
+    const uint col0 = ((lin % per_group) / rows_in_group) * (16 * SG_TC);
+    const uint row0 = (first_row_tile + (lin % per_group) % rows_in_group) * SG_TR;
+
     float acc[SG_TR][SG_TC];
     for (int r = 0; r < SG_TR; r++)
         for (int c = 0; c < SG_TC; c++) acc[r][c] = 0.0f;
-    for (ulong k0 = 0; k0 < K; k0 += 16) {
+    const __global uint* Au = (const __global uint*)A;
+    const __global uint* Bu = (const __global uint*)B;
+    const uint aoff = row0 * K32;
+    uint boff = col0;
+    for (uint k0 = 0; k0 < K32; k0 += 16) {
         float a[SG_TR];
-        for (int r = 0; r < SG_TR; r++) a[r] = A[(row0 + r) * K + k0 + lane];
+#pragma unroll
+        for (int r = 0; r < SG_TR; r++) a[r] = as_float(intel_sub_group_block_read(Au + (aoff + r * K32 + k0)));
+        uint2 q[SG_PF];
+#pragma unroll
+        for (int d = 0; d < SG_PF; d++) q[d] = intel_sub_group_block_read2(Bu + (boff + d * N32));
 #pragma unroll
         for (int kk = 0; kk < 16; kk++) {
-            const uint2 u = intel_sub_group_block_read2((__global const uint*)(B + (k0 + kk) * N + col0));
+            const uint2 u = q[kk % SG_PF];
+            if (kk + SG_PF < 16) q[kk % SG_PF] = intel_sub_group_block_read2(Bu + (boff + (kk + SG_PF) * N32));
             const float b0 = as_float(u.s0), b1 = as_float(u.s1);
 #pragma unroll
             for (int r = 0; r < SG_TR; r++) {
@@ -224,9 +255,10 @@ void matmul_sg(__global const float* A, __global const float* B, __global float*
                 acc[r][1] = mad(av, b1, acc[r][1]);
             }
         }
+        boff += 16 * N32;
     }
     for (int r = 0; r < SG_TR; r++)
-        for (int c = 0; c < SG_TC; c++) C[(row0 + r) * N + col0 + c * 16 + lane] = acc[r][c];
+        for (int c = 0; c < SG_TC; c++) C[(row0 + r) * N32 + col0 + c * 16 + lane] = acc[r][c];
 }
 #endif
 

@@ -16,7 +16,8 @@
 //!
 //! Environment knobs (all optional): `PYTORCHES_XPU_VERBOSE=1` prints device limits to stderr,
 //! `PYTORCHES_XPU_ALLOC=host` adds `CL_MEM_ALLOC_HOST_PTR` to every buffer,
-//! `PYTORCHES_XPU_BUILD_OPTS` replaces the kernel build options.
+//! `PYTORCHES_XPU_BUILD_OPTS` replaces the kernel build options, and `PYTORCHES_XPU_KERNELS=<file>`
+//! compiles that OpenCL source instead of the embedded one (for kernel experiments without a rebuild).
 
 #![allow(non_snake_case)]
 use libloading::Library;
@@ -33,6 +34,8 @@ use std::sync::{Mutex, OnceLock};
 type H = *mut c_void;
 
 const KERNEL_SRC: &str = include_str!("../kernels/kernels.cl");
+/// Rows of C per `matmul_sg` tile (SG_TR in kernels.cl).
+const SG_TILE_ROWS: u64 = 16;
 const DEFAULT_BUILD_OPTS: &str = "-cl-intel-greater-than-4GB-buffer-required";
 const INTEL_VENDOR_ID: u64 = 0x8086;
 
@@ -405,9 +408,24 @@ unsafe fn ensure_ready(g: &Global, d: &Dev, st: &mut State) -> R<()> {
             return Ok(());
         }
         let mut e = 0i32;
-        let src = CString::new(KERNEL_SRC).unwrap();
+        let source = match std::env::var_os("PYTORCHES_XPU_KERNELS") {
+            Some(path) => match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) => {
+                    return fail(
+                        STATUS_INVALID_ARGUMENT,
+                        format!(
+                            "PYTORCHES_XPU_KERNELS {}: {e}",
+                            std::path::Path::new(&path).display()
+                        ),
+                    );
+                }
+            },
+            None => KERNEL_SRC.to_string(),
+        };
+        let src = CString::new(source.as_str()).unwrap();
         let ptr = src.as_ptr();
-        let len = KERNEL_SRC.len();
+        let len = source.len();
         let prog = (g.cl.clCreateProgramWithSource)(d.ctx, 1, &ptr, &len, &mut e);
         check(e, "clCreateProgramWithSource")?;
         let opts = std::env::var("PYTORCHES_XPU_BUILD_OPTS")
@@ -1159,13 +1177,19 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
                 // Sub-group fast path (see kernels.cl) for N % 32 == 0 and K % 16 == 0 on whole 16-row
                 // blocks, when the driver has it. Leftover rows (m % 16) use the general kernel.
                 let mut done = 0u64;
+                // The kernel uses 32-bit element offsets, so every matrix must have fewer than 2^32 elements.
+                let fits32 =
+                    |a: u64, b: u64| a.checked_mul(b).is_some_and(|v| v <= u32::MAX as u64);
                 if nn % 32 == 0
                     && k % 16 == 0
                     && k > 0
-                    && m >= 16
+                    && m >= SG_TILE_ROWS
+                    && fits32(m, k)
+                    && fits32(k, nn)
+                    && fits32(m, nn)
                     && st.kernels.as_ref().unwrap().contains_key("matmul_sg")
                 {
-                    let fast = m / 16 * 16;
+                    let fast = m / SG_TILE_ROWS * SG_TILE_ROWS;
                     launch(
                         g,
                         d,
@@ -1179,7 +1203,7 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
                             Arg::U64(nn),
                             Arg::U64(k),
                         ],
-                        &[(nn / 32) as usize * 16, (fast / 16) as usize],
+                        &[(nn / 32) as usize * 16, (fast / SG_TILE_ROWS) as usize],
                         Some(&[16, 1]),
                     )?;
                     done = fast;
